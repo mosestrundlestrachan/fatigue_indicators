@@ -1,7 +1,21 @@
 import pandas as pd
+import numpy as np
 from pybaseball import statcast_pitcher, playerid_lookup
 from constants import OPENING_DAY
+import os
 
+
+def cached_get_pitch_data(pitcher_id: str, season: int) -> pd.DataFrame:
+    filename = f"cache/{pitcher_id}_{season}.csv"
+    if os.path.exists(filename):
+        print(f"Loading cached data for {season}...")
+        return pd.read_csv(filename)
+    else:
+        print(f"Fetching data for {season}...")
+        df = get_pitch_data(pitcher_id, season)
+        os.makedirs("cache", exist_ok=True)
+        df.to_csv(filename, index=False)
+        return df
 
 
 def get_player_id(pitcher_name: str) -> int:
@@ -137,14 +151,45 @@ def strike_to_ball_ratio(game_df):
         return float("inf")
     return num_strikes / num_balls
 
+#for choosing what xwoba to use for fatigue target
+def average_xwoba_for_two_run_innings(game_dict: dict) -> float:
+    inning_xwobas = []
 
-def build_fatigue_metrics_drop_in(game_dict: dict) -> pd.DataFrame:
+    for game_df in game_dict.values():
+        if "inning" not in game_df.columns or "estimated_woba_using_speedangle" not in game_df.columns:
+            continue
+
+        # Optional: create a column for runs per plate appearance if needed
+        if "runs_scored" not in game_df.columns:
+            if "events" in game_df.columns:
+                game_df["runs_scored"] = game_df["events"].apply(lambda x: 1 if x in ["home_run", "score", "sac_fly"] else 0)
+            else:
+                continue  # skip if we can’t infer runs
+
+        # Group by inning and calculate runs
+        grouped = game_df.groupby("inning")
+        for inning, df_inning in grouped:
+            total_runs = df_inning["runs_scored"].sum()
+            xwoba_vals = df_inning["estimated_woba_using_speedangle"].dropna()
+
+            if total_runs == 2 and not xwoba_vals.empty:
+                inning_avg = xwoba_vals.mean()
+                inning_xwobas.append(inning_avg)
+
+    if not inning_xwobas:
+        print("⚠️ No qualifying innings found with exactly 2 runs scored.")
+        return None
+
+    return sum(inning_xwobas) / len(inning_xwobas)
+
+
+def build_fatigue_metrics_drop_in(game_dict: dict, fatigue_xwoba_threshold: float) -> pd.DataFrame:
     """
     For each game, compute fatigue indicators:
     - Avg velocity drop (FF only, if available)
     - Spin rate drop by pitch type
     - Strike-to-ball ratio
-    - Total pitch count
+    - delta xwOBA (late - early), batted balls only
 
     Returns:
     - A DataFrame with one row per game and fatigue metrics as columns.
@@ -152,40 +197,43 @@ def build_fatigue_metrics_drop_in(game_dict: dict) -> pd.DataFrame:
     records = []
 
     for date, game_df in game_dict.items():
-        # Fastball velocity drop (1st inning vs 5th+)
+        if "inning" not in game_df.columns or "estimated_woba_using_speedangle" not in game_df.columns:
+            continue
+
+        fatigued = False
+        late_innings = game_df[game_df["inning"] > 3]
+
+        if not late_innings.empty:
+            for inning in late_innings["inning"].unique():
+                batted = late_innings[
+                    (late_innings["inning"] == inning) &
+                    (late_innings["estimated_woba_using_speedangle"].notna())
+                ]
+                if not batted.empty:
+                    inning_xwoba = batted["estimated_woba_using_speedangle"].mean()
+                    if inning_xwoba > .320:
+                        fatigued = True
+                        break
+
         ff_df = game_df[game_df["pitch_type"] == "FF"]
-        if not ff_df.empty:
-            early_vel = ff_df[ff_df["inning"].isin([1, 2, 3])]["release_speed"].mean()
-            late_vel = ff_df[ff_df["inning"] >= 5]["release_speed"].mean()
-            if pd.notna(early_vel) and pd.notna(late_vel):
-                velocity_drop = early_vel - late_vel
-            else:
-                velocity_drop = None
-        else:
-            velocity_drop = None
+        early_vel = ff_df[ff_df["inning"].isin([1, 2, 3])]["release_speed"].mean()
+        late_vel = ff_df[ff_df["inning"] >= 5]["release_speed"].mean()
+        velocity_drop = early_vel - late_vel if pd.notna(early_vel) and pd.notna(late_vel) else None
 
-        # Spin rate drop (FF only)
         spin_drop_dict = spin_rate_drop_by_pitch(game_df)
-        if "FF" in spin_drop_dict:
-            spin_drop_ff = spin_drop_dict["FF"]
-        else:
-            spin_drop_ff = None
+        spin_drop_ff = spin_drop_dict.get("FF", None)
 
-        # Strike-to-ball ratio
         ratio = strike_to_ball_ratio(game_df)
-
-        # Total pitch count
-        #pitch_count = len(game_df)
 
         records.append({
             "game_date": date,
             "velocity_drop_ff": velocity_drop,
             "spin_rate_drop_ff": spin_drop_ff,
             "strike_to_ball_ratio": ratio,
-            #"pitch_count": pitch_count
+            "fatigued": int(fatigued)
         })
-
     return pd.DataFrame(records)
+
 
 
 def build_early_game_feature_df(game_dict: dict) -> pd.DataFrame:
@@ -308,12 +356,22 @@ def build_training_dataframe(game_dict: dict) -> pd.DataFrame:
     Builds a combined training DataFrame using:
     - Early game features (innings 1–3)
     - Fatigue targets (velocity/spin drop from early to late innings)
-    
+
     Returns:
     - Merged DataFrame with one row per game and all features + targets
     """
+    # Compute early-game features
     features_df = build_target_dataframe(game_dict, innings=[1, 2, 3])
-    fatigue_df = build_fatigue_metrics_drop_in(game_dict)
+
+    # Compute data-driven fatigue threshold once
+    fatigue_threshold = average_xwoba_for_two_run_innings(game_dict)
+
+    if fatigue_threshold is None:
+        print("❌ Could not compute fatigue threshold. No training data generated.")
+        return pd.DataFrame()
+
+    # Compute fatigue targets with threshold
+    fatigue_df = build_fatigue_metrics_drop_in(game_dict, fatigue_threshold)
 
     # Merge on game_date
     merged_df = pd.merge(features_df, fatigue_df, on="game_date")
@@ -321,9 +379,8 @@ def build_training_dataframe(game_dict: dict) -> pd.DataFrame:
     # Drop rows with missing values
     merged_df = merged_df.dropna()
 
-    # adding binary fatigue indicator
-    merged_df["fatigued"] = merged_df["velocity_drop_ff"] > 2.0
+    # Optional: print stats
+    print("📊 Fatigue Label Distribution:")
+    print(merged_df["fatigued"].value_counts())
 
     return merged_df
-
-
